@@ -1,0 +1,48 @@
+.idea/
+.vscode/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.env
+.env
+.venv/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test
+.coverage
+htmlcov/
+
+# Models and data
+*.h5
+*.pkl
+*.csv
+*.sqlite3
+*.db
+
+# Misc
+*.swp
+*.bak
+*.tmp
+
+# Node
+node_modules/
