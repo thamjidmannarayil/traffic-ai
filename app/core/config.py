@@ -1,2 +1,2 @@
 # Database configuration
-DATABASE_URL = "sqlite:///./traffic.db"
+DATABASE_URL = "postgresql://thamjid:thachu#01@localhost:5432/traffic_ai"

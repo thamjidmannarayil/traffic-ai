@@ -15,6 +15,6 @@ class TravelRecord(Base):
 	time_of_day = Column(String, nullable=False)
 	weather = Column(String, nullable=False)
 	day_of_week = Column(String, nullable=False)
-	festival = Column(Boolean, nullable=False)
+	festival = Column(String, nullable=True)
 	actual_travel_time_min = Column(Float, nullable=False)
 	road_type = Column(String, nullable=False)
