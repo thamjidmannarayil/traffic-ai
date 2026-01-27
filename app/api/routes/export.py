@@ -1,12 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
-from typing import List
 import csv
 import datetime
 from app.db.models import TravelRecord
 from app.db.session import SessionLocal
-from app.models.request import TravelRecordCreate
-from app.models.response import TravelRecordOut
 from io import StringIO
 
 router = APIRouter(prefix="/api/v1", tags=["Export Records"])
