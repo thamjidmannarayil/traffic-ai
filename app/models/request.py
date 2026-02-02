@@ -50,3 +50,23 @@ class TravelRecordUpdate(BaseModel):
 		except ValueError:
 			raise ValueError("time_of_day must be in 'HH:MM' format")
 		return value
+
+
+class MultiPredictRequest(BaseModel):
+	date: Optional[date] = None
+	source: Optional[str] = None
+	destination: Optional[str] = None
+	time_of_day: str
+	weather: str
+	day_of_week: str
+	festival: bool
+	road_type: str
+
+	@field_validator("time_of_day")
+	@classmethod
+	def validate_time_format(cls, value: str) -> str:
+		try:
+			datetime.strptime(value, "%H:%M")
+		except ValueError:
+			raise ValueError("time_of_day must be in 'HH:MM' format")
+		return value

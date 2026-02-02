@@ -2,13 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.db.models import TravelRecord
 from app.db.session import SessionLocal
-from app.models.request import TravelRecordCreate
+from app.models.request import TravelRecordCreate, MultiPredictRequest
 from app.models.response import TravelRecordOut
 import pandas as pd
 import joblib
 import os
 import logging
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.multioutput import MultiOutputRegressor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,10 +20,12 @@ router = APIRouter(prefix="/predictions", tags=["Predict Travel Records"])
 # Paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 MODEL_PATH = os.path.join(PROJECT_ROOT, "traffic_model.joblib")
+MODEL_PATH_MULTI = os.path.join(PROJECT_ROOT, "traffic_model_multi.joblib")
 
 
 # Load trained model once at module import
 model = None
+model_multi = None
 
 def _load_model():
     """Load model from disk into module-level variable."""
@@ -49,6 +52,40 @@ def _load_model():
 
 
 _load_model()
+
+
+def _load_model_multi():
+    """Load multi-output model from disk if present."""
+    global model_multi
+    if not os.path.exists(MODEL_PATH_MULTI):
+        logger.info(f"No multi-output model found at {MODEL_PATH_MULTI}; skipping load.")
+        model_multi = None
+        return
+    try:
+        logger.info(f"Loading multi-output model from: {MODEL_PATH_MULTI}")
+        loaded = joblib.load(MODEL_PATH_MULTI)
+        # We store a dict {"model": model, "targets": [...], "sources": [...], "destinations": [...]}
+        if isinstance(loaded, dict) and "model" in loaded:
+            model_multi = loaded
+            feature_names = getattr(model_multi["model"], "feature_names_in_", None)
+            if feature_names is not None:
+                logger.info(f"Multi model features ({len(feature_names)}): {list(feature_names)}")
+        else:
+            # Backward compat: plain model
+            model_multi = {
+                "model": loaded,
+                "targets": ["distance_km", "congestion_index", "actual_travel_time_min"],
+                "sources": [],
+                "destinations": [],
+            }
+    except Exception as exc:
+        logger.error(f"Failed to load multi model: {exc}")
+        import traceback
+        logger.error(traceback.format_exc())
+        model_multi = None
+
+
+_load_model_multi()
 
 
 def get_db():
@@ -165,6 +202,40 @@ def preprocess_training_dataframe(df: pd.DataFrame):
     return X, y
 
 
+def preprocess_training_multi_dataframe(df: pd.DataFrame):
+    """
+    Prepare training data for multi-output regression predicting
+    distance_km, congestion_index, and actual_travel_time_min.
+    """
+    df = df.copy()
+    df.columns = [str(col) for col in df.columns]
+
+    target_cols = ["distance_km", "congestion_index", "actual_travel_time_min"]
+    missing = set(target_cols) - set(df.columns)
+    if missing:
+        raise ValueError(f"Training data missing required targets: {', '.join(sorted(missing))}")
+
+    # Validate & transform time
+    parsed_times = pd.to_datetime(df["time_of_day"], format="%H:%M", errors="coerce")
+    if parsed_times.isna().any():
+        bad_rows = df.loc[parsed_times.isna(), "time_of_day"].unique()
+        raise ValueError(f"Invalid time_of_day format encountered: {bad_rows}")
+    df["time_minutes"] = parsed_times.dt.hour * 60 + parsed_times.dt.minute
+    df = df.drop(columns=["time_of_day"])
+
+    df["festival"] = df["festival"].apply(_boolify).astype(int)
+
+    y = df[target_cols].astype(float)
+    # Keep source/destination as categorical features to capture route specifics
+    feature_df = df.drop(columns=target_cols + ["id", "date"], errors="ignore")
+
+    cat_cols = ["weather", "road_type", "day_of_week", "source", "destination"]
+    X = pd.get_dummies(feature_df, columns=cat_cols, drop_first=False)
+    X.columns = [str(col) for col in X.columns]
+
+    return X, y
+
+
 @router.post("/train", response_model=dict)
 def train_model_endpoint(db: Session = Depends(get_db)):
     """
@@ -193,6 +264,8 @@ def train_model_endpoint(db: Session = Depends(get_db)):
     try:
         new_model = RandomForestRegressor(n_estimators=200, random_state=42)
         new_model.fit(X, y)
+        # Ensure feature_names_in_ exists for downstream inference
+        new_model.feature_names_in_ = X.columns.to_numpy()
     except Exception as exc:
         logger.error(f"Model training failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Model training failed: {exc}")
@@ -214,6 +287,71 @@ def train_model_endpoint(db: Session = Depends(get_db)):
         "message": "Model retrained and saved.",
         "records_used": int(len(df)),
         "feature_count": int(len(new_model.feature_names_in_)),
+    }
+
+
+@router.post("/train-multi", response_model=dict)
+def train_model_multi_endpoint(db: Session = Depends(get_db)):
+    """
+    Train a multi-output model to predict distance_km, congestion_index, and actual_travel_time_min.
+    """
+    try:
+        engine = db.get_bind()
+        df = pd.read_sql_table(TravelRecord.__tablename__, con=engine)
+        df.columns = [str(col) for col in df.columns]
+    except Exception as exc:
+        logger.error(f"Failed to fetch training data: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to load training data: {exc}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="No data available to train the multi-output model.")
+
+    try:
+        X, y = preprocess_training_multi_dataframe(df)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        base_estimator = RandomForestRegressor(n_estimators=200, random_state=42)
+        new_model = MultiOutputRegressor(base_estimator)
+        new_model.fit(X, y)
+        new_model.feature_names_in_ = X.columns.to_numpy()
+        target_names = list(y.columns)
+        source_values = sorted(df["source"].unique().tolist())
+        destination_values = sorted(df["destination"].unique().tolist())
+    except Exception as exc:
+        logger.error(f"Multi model training failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Multi model training failed: {exc}")
+
+    try:
+        os.makedirs(os.path.dirname(MODEL_PATH_MULTI), exist_ok=True)
+        joblib.dump(
+            {
+                "model": new_model,
+                "targets": target_names,
+                "sources": source_values,
+                "destinations": destination_values,
+            },
+            MODEL_PATH_MULTI,
+        )
+    except Exception as exc:
+        logger.error(f"Failed to save multi model: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to save multi model: {exc}")
+
+    global model_multi
+    model_multi = {
+        "model": new_model,
+        "targets": target_names,
+        "sources": source_values,
+        "destinations": destination_values,
+    }
+    logger.info("✓ Multi-output model retrained and saved.")
+
+    return {
+        "message": "Multi-output model retrained and saved.",
+        "records_used": int(len(df)),
+        "feature_count": int(len(new_model.feature_names_in_)),
+        "targets": target_names,
     }
 
 
@@ -239,13 +377,11 @@ def predict_data(record: TravelRecordCreate, db: Session = Depends(get_db)):
 
         logger.info(f"Received prediction request for route: {record.source} -> {record.destination}")
 
-        # Convert to dict and remove actual_travel_time_min if it exists
-        # (since we're predicting it, user shouldn't provide it)
         record_dict = record.model_dump()
         if "actual_travel_time_min" in record_dict:
             record_dict.pop("actual_travel_time_min")
 
-        # Preprocess input for prediction
+
         try:
             X = preprocess_input(record_dict)
         except ValueError as exc:
@@ -280,3 +416,51 @@ def predict_data(record: TravelRecordCreate, db: Session = Depends(get_db)):
             status_code=500,
             detail=f"Prediction failed: {str(e)}"
         )
+
+
+@router.post("/multi", response_model=dict)
+def predict_multi(record: MultiPredictRequest):
+    """
+    Predict distance_km, congestion_index, and actual_travel_time_min from inputs.
+    Does NOT write to the database; returns predictions only.
+    """
+    if model_multi is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Multi-output model is not loaded. Train it via /predictions/train-multi."
+        )
+
+    # Accept the same input schema; strip any target fields if present
+    record_dict = record.model_dump()
+
+    try:
+        df = pd.DataFrame([record_dict])
+        parsed_times = pd.to_datetime(df["time_of_day"], format="%H:%M")
+        df["time_minutes"] = parsed_times.dt.hour * 60 + parsed_times.dt.minute
+        df = df.drop(columns=["time_of_day"])
+        df["festival"] = df["festival"].astype(int)
+        cat_cols = ["weather", "road_type", "day_of_week", "source", "destination"]
+        X = pd.get_dummies(df, columns=cat_cols, drop_first=False)
+
+        # Validate seen source/destination
+        seen_sources = set(model_multi.get("sources", []))
+        seen_destinations = set(model_multi.get("destinations", []))
+        if df.at[0, "source"] not in seen_sources:
+            raise HTTPException(status_code=400, detail=f"Unknown source '{df.at[0, 'source']}'. Train includes: {sorted(seen_sources)}")
+        if df.at[0, "destination"] not in seen_destinations:
+            raise HTTPException(status_code=400, detail=f"Unknown destination '{df.at[0, 'destination']}'. Train includes: {sorted(seen_destinations)}")
+
+        # Reindex to expected columns
+        features = model_multi["model"].feature_names_in_
+        X = X.reindex(columns=features, fill_value=0)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Preprocessing failed: {exc}")
+
+    try:
+        preds = model_multi["model"].predict(X)[0]
+        targets = model_multi.get("targets") or ["distance_km", "congestion_index", "actual_travel_time_min"]
+        return dict(zip(targets, map(float, preds)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}")
