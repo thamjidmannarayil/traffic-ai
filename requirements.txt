@@ -5,4 +5,7 @@ pydantic
 psycopg2
 alembic
 pandas
+python-multipart
 scikit-learn
+
+joblib
