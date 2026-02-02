@@ -46,3 +46,6 @@ htmlcov/
 
 # Node
 node_modules/
+
+# models
+*.joblib
